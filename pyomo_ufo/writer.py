@@ -11,7 +11,10 @@ Supported problem types
 - NLP with linear equality/inequality constraints
 - NLP with nonlinear equality/inequality constraints
 
-All problems use ``$MODEL='FF'`` (general nonlinear objective).
+A linear objective uses ``$MODEL='FL'``; a nonlinear objective is written with
+``$MODEL='FF'`` (value in FMODELF, analytical gradient in GMODELF). With general
+constraints the method is selected as ``$FORM='SE'`` (all-equality) or ``'SI'``
+(any inequality) with ``$CLASS='VM'``.
 
 Usage::
 
@@ -26,8 +29,9 @@ import math
 
 import pyomo.environ as pyo
 from pyomo.core.expr.visitor import identify_variables, polynomial_degree
+from pyomo.core.expr.calculus.derivatives import differentiate, Modes
 from pyomo.core import value as pyo_value
-from pyomo.core.expr.numeric_expr import LinearExpression
+from pyomo.core.expr.numeric_expr import LinearExpression, SumExpression
 from pyomo.repn import generate_standard_repn
 from .fortran_expr import to_fortran, _fortran_const
 
@@ -224,7 +228,20 @@ class UFOWriter:
             )
 
         externalize = mc > self._MAX_INLINE_CG
-        externalize_nl = (bool(nonlinear_cons)
+        # The compact "data-driven" FMODELC path (a single BL1-indexed formula
+        # read from CDATA.IN) only works when *every* nonlinear constraint is
+        # the binary-complementarity shape y*(1-y)==0. General nonlinear
+        # constraints (e.g. prob24's cubic equalities) must be emitted inline
+        # as an IF(KC.EQ.k) ladder instead, whatever their count. So only take
+        # the data-driven path when all nonlinear constraints are that shape.
+        nl_all_complementarity = False
+        if nonlinear_cons:
+            idx_map_1based = {id(v): i + 1 for i, v in enumerate(ordered_vars)}
+            nl_all_complementarity = all(
+                self._complementarity_index(body, idx_map_1based) is not None
+                for (_n, body, _lb, _ub, _k) in nonlinear_cons
+            )
+        externalize_nl = (nl_all_complementarity
                           and len(nonlinear_cons) > self._MAX_INLINE_NL)
         needs_data_file = externalize or externalize_nl
 
@@ -289,22 +306,32 @@ class UFOWriter:
         # ---- $SET(FMODELF) — required when MODEL='FF' --------------
         if self.model_kind == 'FF':
             self._write_fmodelf_block(w, obj.expr, var_map)
-            # Analytical gradient for a linear objective. Without this,
-            # UFO finite-differences the gradient (nf F-evals per iter),
-            # which is what caused MFV TOO SMALL for this problem.
+            # Analytical objective gradient. Without it UFO finite-differences
+            # the gradient (nf F-evals per iteration), which is inaccurate for
+            # nonlinear objectives and drove the interior-point method to
+            # diverge (F/G exploding) on larger problems.
             obj_is_linear = (
                 obj_repn.nonlinear_expr is None
                 and not (getattr(obj_repn, 'quadratic_vars', None) or [])
             )
+            w('$SET(GMODELF)\n')
             if obj_is_linear:
-                w('$SET(GMODELF)\n')
                 self._write_gmodelf_block(w, obj_repn, var_map, nf)
-                w('$ENDSET\n')
+            else:
+                self._write_gmodelf_analytic(w, obj.expr, ordered_vars, var_map)
+            w('$ENDSET\n')
 
         # ---- $SET(FMODELCS) (nonlinear constraints only) -----------
         if nonlinear_cons:
             self._write_fmodelcs_block(w, nonlinear_cons,
-                                       linear_cons, var_map)
+                                       linear_cons, var_map,
+                                       use_data_driven=externalize_nl)
+            # Analytical constraint gradients for the inline (general
+            # nonlinear) path. The data-driven complementarity path keeps its
+            # own handling. Without these UFO finite-differences the Jacobian.
+            if not externalize_nl:
+                self._write_gmodelc_block(w, nonlinear_cons, linear_cons,
+                                          var_map)
 
         # ---- $SET(OUTPUT) — dump solution X to P.SOL ---------------
         # UFO doesn't print X=... to P.OUT for large NF, so write it
@@ -337,11 +364,22 @@ class UFOWriter:
         w(f'$KBF={kbf}\n')
         if nc > 0:
             w(f'$KBC={kbc}\n')
-        # CD = constrained-descent; handles MODEL='FF' with general NC
-        # and box bounds. Default VL (limited-memory VM) runs penalty
-        # iterations that explode the objective and ignore XL/XU.
+        # Method selection for a nonlinear objective with general
+        # constraints. Let UFO pick with no $FORM (it falls back to a
+        # limited-memory interior-point method, VL-LI3) diverges on stiff
+        # equality-constrained problems (e.g. prob24). Instead pick the
+        # recursive-QP / interior-point form matching the constraint mix and
+        # use the full variable-metric class (VM), which converges reliably:
+        #   all general constraints equality  -> $FORM='SE' (sparse equality
+        #                                         recursive QP)
+        #   any inequality general constraint -> $FORM='SI' (primal-dual
+        #                                         interior point)
         if self.model_kind == 'FF' and nc > 0:
-            w("$CLASS='CD'\n")
+            all_equality = all(
+                kind == 'eq' for *_, kind in (linear_cons + nonlinear_cons)
+            )
+            w("$FORM='SE'\n" if all_equality else "$FORM='SI'\n")
+            w("$CLASS='VM'\n")
         w(f"$MODEL='{self.model_kind}'\n")
         w("$NZ=50000\n")
         w("$NAU=50000\n")
@@ -651,30 +689,15 @@ class UFOWriter:
         w('$SET(FMODELF)\n')
         expr_str = to_fortran(obj_expr, var_map)
         if len(expr_str) <= 500:
-            w(f'  FF = {expr_str}\n')
+            self._emit_continued(w, f'FF = {expr_str}')
         else:
-            # Long expression: use chunked accumulation via repn
-            repn = generate_standard_repn(obj_expr)
-            const = float(repn.constant) if repn.constant else 0.0
-            w(f'  FF = {_fortran_const(const)}\n')
-            if repn.linear_vars:
-                for coef, var in zip(repn.linear_coefs, repn.linear_vars):
-                    vn = var_map.get(id(var))
-                    if vn is None:
-                        continue
-                    c = float(coef)
-                    if c < 0:
-                        w(f'  FF=FF+({_fortran_const(c)})*{vn}\n')
-                    else:
-                        w(f'  FF=FF+{_fortran_const(c)}*{vn}\n')
-            if hasattr(repn, 'quadratic_vars') and repn.quadratic_vars:
-                for coef, (v1, v2) in zip(repn.quadratic_coefs, repn.quadratic_vars):
-                    vn1 = var_map.get(id(v1), '?')
-                    vn2 = var_map.get(id(v2), '?')
-                    w(f'  FF = FF + {_fortran_const(float(coef))}*{vn1}*{vn2}\n')
-            if repn.nonlinear_expr is not None:
-                nl_str = to_fortran(repn.nonlinear_expr, var_map)
-                w(f'  FF = FF + ({nl_str})\n')
+            # Long objective (e.g. a large sum of squares): a single
+            # 'FF = <expr>' statement overflows ufobel's fixed-form
+            # continuation limit and is silently truncated. Split the
+            # top-level sum into additive terms and accumulate them across
+            # several length-bounded 'FF = FF + ...' statements.
+            w('  FF = 0.0D0\n')
+            self._emit_ff_accumulation(w, obj_expr, var_map)
         # Append the iterate (F, X) to P.TRACE so the Python side can pick
         # the best feasible iterate even if UFO ends in a divergent state.
         w("  OPEN(94,FILE='P.TRACE',STATUS='UNKNOWN',POSITION='APPEND')\n")
@@ -685,6 +708,87 @@ class UFOWriter:
         w("  WRITE(94,'(A)') '#END'\n")
         w('  CLOSE(94)\n')
         w('$ENDSET\n')
+
+    def _additive_fortran_terms(self, expr, var_map):
+        """
+        Flatten *expr* into a list of Fortran strings whose sum equals it.
+
+        Descends through Sum and Linear expressions so no single term carries
+        the whole objective; any other node becomes one term via ``to_fortran``.
+        """
+        out = []
+        stack = [expr]
+        while stack:
+            e = stack.pop()
+            if isinstance(e, SumExpression):
+                stack.extend(reversed(list(e.args)))
+            elif isinstance(e, LinearExpression):
+                if e.constant:
+                    c = float(e.constant)
+                    if c != 0.0:
+                        out.append(_fortran_const(c))
+                for coef, var in zip(e.linear_coefs, e.linear_vars):
+                    vn = var_map.get(id(var))
+                    if vn is None:
+                        continue
+                    cf = float(coef)
+                    if cf == 1.0:
+                        out.append(vn)
+                    elif cf == -1.0:
+                        out.append(f'(-{vn})')
+                    else:
+                        out.append(f'{_fortran_const(cf)}*{vn}')
+            else:
+                out.append(to_fortran(e, var_map))
+        return out
+
+    def _emit_ff_accumulation(self, w, expr, var_map, budget=250):
+        """
+        Emit ``FF = FF + (t1) + (t2) + ...`` statements for the additive terms
+        of *expr*, packing terms so each statement stays under *budget* chars
+        (bounds the continuation-line count per statement) and wrapping each to
+        <=72 columns.
+        """
+        cur, cur_len = [], 0
+        for s in self._additive_fortran_terms(expr, var_map):
+            piece = f'({s})'
+            if cur and cur_len + len(piece) + 3 > budget:
+                self._emit_continued(w, 'FF = FF + ' + ' + '.join(cur))
+                cur, cur_len = [], 0
+            cur.append(piece)
+            cur_len += len(piece) + 3
+        if cur:
+            self._emit_continued(w, 'FF = FF + ' + ' + '.join(cur))
+
+    @staticmethod
+    def _emit_continued(w, text, maxcol=70):
+        """
+        Emit a Fortran statement as one logical line split into physical lines
+        of at most ``maxcol`` columns, joined with trailing ``&`` continuation.
+
+        ufobel auto-wraps any source line longer than ~72 columns and its
+        wrapper splits tokens (producing invalid Fortran), so long statements
+        must be pre-wrapped here. ``&`` continuation concatenates the physical
+        lines, and fixed-form Fortran ignores blanks, so breaking between any
+        two characters is safe; we prefer a break just after an operator for
+        readability. The first line is indented two spaces (total <=72);
+        continuation lines carry no indent.
+        """
+        chunks = []
+        while len(text) > maxcol:
+            cut = maxcol
+            for i in range(maxcol, maxcol - 24, -1):
+                if i < len(text) and text[i - 1] in '+-*/,) ':
+                    cut = i
+                    break
+            chunks.append(text[:cut])
+            text = text[cut:]
+        chunks.append(text)
+        last = len(chunks) - 1
+        for idx, ch in enumerate(chunks):
+            prefix = '  ' if idx == 0 else ''
+            suffix = '&' if idx < last else ''
+            w(f'{prefix}{ch}{suffix}\n')
 
     def _write_gmodelf_block(self, w, repn, var_map, nf):
         """Write analytical gradient of the objective (GMODELF block)."""
@@ -712,17 +816,15 @@ class UFOWriter:
     # Max nonlinear constraints before switching to data-driven approach
     _MAX_INLINE_NL = 50
 
-    def _classify_nl_shape(self, body, var_id_to_idx):
+    def _complementarity_index(self, body, var_id_to_idx):
         """
-        Verify a nonlinear constraint body has the binary-complementarity
-        shape ``y*(1-y) == y - y**2`` and return the 1-based variable index.
-        Raises NotImplementedError for any other shape.
+        If ``body`` has the binary-complementarity shape ``y*(1-y) ==
+        y - y**2``, return the 1-based index of ``y`` (from *var_id_to_idx*,
+        a 1-based map). Otherwise return None. Never raises.
         """
         repn = generate_standard_repn(body)
         if repn.nonlinear_expr is not None:
-            raise NotImplementedError(
-                f'Unsupported nonlinear constraint (non-quadratic): {body}'
-            )
+            return None
         const = float(repn.constant) if repn.constant else 0.0
         qvars = list(repn.quadratic_vars) if repn.quadratic_vars else []
         qcoefs = [float(c) for c in (repn.quadratic_coefs or [])]
@@ -730,35 +832,74 @@ class UFOWriter:
         lcoefs = [float(c) for c in (repn.linear_coefs or [])]
 
         if abs(const) > 1e-14 or len(qvars) != 1 or len(lvars) != 1:
-            raise NotImplementedError(
-                f'Unsupported nonlinear constraint shape: {body}'
-            )
+            return None
         v1, v2 = qvars[0]
         if (id(v1) == id(v2) and id(lvars[0]) == id(v1)
                 and abs(lcoefs[0] - 1.0) < 1e-14
                 and abs(qcoefs[0] + 1.0) < 1e-14):
-            idx = var_id_to_idx.get(id(v1), 0)
-            if idx == 0:
-                raise NotImplementedError(
-                    f'Variable not in index map for constraint: {body}'
-                )
-            return idx
+            return var_id_to_idx.get(id(v1)) or None
+        return None
 
-        raise NotImplementedError(
-            f'Unsupported nonlinear constraint shape '
-            f'(expected y*(1-y)): {body}'
-        )
+    def _classify_nl_shape(self, body, var_id_to_idx):
+        """
+        Binary-complementarity index of ``body`` (see
+        :meth:`_complementarity_index`), raising if the shape is not the
+        ``y*(1-y)`` form the data-driven path requires.
+        """
+        idx = self._complementarity_index(body, var_id_to_idx)
+        if idx is None:
+            raise NotImplementedError(
+                'Data-driven FMODELC path requires binary complementarity '
+                f'y*(1-y); got: {body}'
+            )
+        return idx
 
-    def _write_fmodelcs_block(self, w, nonlinear_cons, linear_cons, var_map):
+    def _write_gmodelf_analytic(self, w, obj_expr, ordered_vars, var_map):
+        """
+        Emit the analytical objective gradient GF(i)=d(obj)/dx_i for a
+        nonlinear objective, using symbolic (reverse-mode) differentiation.
+        One derivative per variable; absent variables give GF(i)=0.
+        """
+        derivs = differentiate(obj_expr, wrt_list=list(ordered_vars),
+                               mode=Modes.reverse_symbolic)
+        for i, d in enumerate(derivs, start=1):
+            self._emit_continued(w, f'GF({i})={to_fortran(d, var_map)}')
+
+    def _write_gmodelc_block(self, w, nonlinear_cons, linear_cons, var_map):
+        """
+        Emit analytical constraint gradients GC(i)=d c_KC/dx_i for the inline
+        nonlinear constraints, mirroring the FMODELC IF(KC.EQ.k) ladder. Only
+        the variables each constraint depends on are written (sparse Jacobian).
+        """
         offset = len(linear_cons)
-        if len(nonlinear_cons) <= self._MAX_INLINE_NL:
-            # Small number: use IF/ELSEIF branches
+        w('$SET(GMODELC)\n')
+        w('  IF(KC.LE.0)THEN\n')
+        for k, (name, body, lb, ub, kind) in enumerate(nonlinear_cons):
+            kc = offset + k + 1
+            w(f'  ELSEIF(KC.EQ.{kc})THEN\n')
+            cvars = [v for v in identify_variables(body, include_fixed=False)
+                     if id(v) in var_map]
+            derivs = differentiate(body, wrt_list=cvars,
+                                   mode=Modes.reverse_symbolic)
+            for var, d in zip(cvars, derivs):
+                idx = int(var_map[id(var)][2:-1])   # 'X(i)' -> i
+                self._emit_continued(w, f'GC({idx})={to_fortran(d, var_map)}')
+        w('  ENDIF\n')
+        w('$ENDSET\n')
+
+    def _write_fmodelcs_block(self, w, nonlinear_cons, linear_cons, var_map,
+                              use_data_driven):
+        offset = len(linear_cons)
+        if not use_data_driven:
+            # Emit each constraint inline as an IF(KC.EQ.k) branch. Handles
+            # arbitrary nonlinear bodies (via to_fortran); used for any number
+            # of general nonlinear constraints.
             w('$SET(FMODELC)\n')
             w('  IF(KC.LE.0)THEN\n')
             for k, (name, body, lb, ub, kind) in enumerate(nonlinear_cons):
                 kc = offset + k + 1
                 w(f'  ELSEIF(KC.EQ.{kc})THEN\n')
-                w(f'    FC={to_fortran(body, var_map)}\n')
+                self._emit_continued(w, f'FC={to_fortran(body, var_map)}')
             w('  ENDIF\n')
             w('$ENDSET\n')
         else:
