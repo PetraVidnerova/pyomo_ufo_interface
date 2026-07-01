@@ -5,8 +5,8 @@ Demonstration of the pyomo_ufo solver interface.
 
 Run from the UFO root directory:
 
-    cd /home/petra/work_tacr/UFO
-    python examples/demo_ufo.py
+    cd pyomo_ufo_interface
+    uv run demo_ufo.py
 """
 
 import sys
