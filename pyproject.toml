@@ -1,0 +1,9 @@
+[project]
+name = "pyomo-ufo-interface"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pyomo>=6.10.1",
+]
